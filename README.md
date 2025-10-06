@@ -42,6 +42,16 @@
 | image_height | int | 1080 | 图像高度 |
 | auto_reconnect | bool | true | 自动重连 |
 
+## 编译
+首先将仓库克隆到自己工作区的`src/`目录下，例如`path/to/camera_ws/src/`
+
+```bash
+cd /path/to/camera_ws
+colcon build --packages-select hk_camera
+source install/setup.bash
+```
+
+
 ## 使用方法
 
 ### 1. 启动相机节点
@@ -98,13 +108,6 @@ ros2 param set /hk_camera_node frame_rate 60.0
 | /image_raw | sensor_msgs/Image | 图像数据 |
 | ~/actual_frame_rate | std_msgs/Float64 | 实际帧率（新增） |
 
-## 编译
-
-```bash
-cd /path/to/camera_ws
-colcon build --packages-select hk_camera
-source install/setup.bash
-```
 
 ## 注意事项
 
