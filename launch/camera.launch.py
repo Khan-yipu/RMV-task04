@@ -1,9 +1,8 @@
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -49,7 +48,7 @@ def generate_launch_description():
     declared_arguments.append(
         DeclareLaunchArgument(
             "exposure_time",
-            default_value="8000.0",
+            default_value="20000.0",
             description="Exposure time in microseconds",
         )
     )
@@ -91,7 +90,7 @@ def generate_launch_description():
     declared_arguments.append(
         DeclareLaunchArgument(
             "use_transport",
-            default_value="true",
+            default_value="false",
             description="Use image transport",
         )
     )
@@ -104,7 +103,7 @@ def generate_launch_description():
     )
     declared_arguments.append(
         DeclareLaunchArgument(
-            "rviz",
+            "start_rviz",
             default_value="false",
             description="Start RViz2 automatically",
         )
@@ -124,7 +123,7 @@ def generate_launch_description():
     image_height = LaunchConfiguration("image_height")
     use_transport = LaunchConfiguration("use_transport")
     auto_reconnect = LaunchConfiguration("auto_reconnect")
-    rviz = LaunchConfiguration("rviz")
+    start_rviz = LaunchConfiguration("start_rviz")
 
     # HK Camera node
     hk_camera_node = Node(
@@ -151,22 +150,8 @@ def generate_launch_description():
         ],
     )
 
-    # RViz node
-    rviz_config = PathJoinSubstitution(
-        [FindPackageShare("hk_camera"), "config", "rviz_config.rviz"]
-    )
-    rviz_node = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz2",
-        arguments=["-d", rviz_config],
-        condition=IfCondition(rviz),
-        output="screen",
-    )
-
     nodes = [
         hk_camera_node,
-        rviz_node,
     ]
 
     return LaunchDescription(declared_arguments + nodes)

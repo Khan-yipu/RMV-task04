@@ -82,7 +82,6 @@ private:
   
   // Threading
   std::thread image_thread_;
-  std::thread frame_rate_thread_;
   std::mutex camera_mutex_;
   std::atomic<bool> should_stop_;
   
@@ -95,7 +94,14 @@ private:
   MvGvspPixelType getPixelFormatEnum(const std::string & pixel_format_str);
   
   // Frame rate monitoring
-  void frameRateMonitorCallback();
+  void frameRateTimerCallback();
+  rclcpp::TimerBase::SharedPtr frame_rate_timer_;
+  
+  // Custom frame rate calculation
+  std::atomic<uint64_t> frame_count_{0};
+  std::chrono::steady_clock::time_point last_time_;
+  std::mutex frame_rate_mutex_;
+  double calculated_fps_{0.0};
 };
 
 }  // namespace hk_camera

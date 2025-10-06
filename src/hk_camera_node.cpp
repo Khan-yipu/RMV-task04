@@ -2,12 +2,23 @@
 
 #include <opencv2/opencv.hpp>
 
-#include <chrono>
-#include <functional>
 #include <memory>
+#include <string>
+#include <vector>
 #include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
 
-using namespace std::chrono_literals;
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/image.hpp"
+#include "std_msgs/msg/float64.hpp"
+#include "image_transport/image_transport.hpp"
+#include "cv_bridge/cv_bridge.h"
+
+#include "MvCameraControl.h"
+#include "MvErrorDefine.h"
+#include "PixelType.h"
 
 namespace hk_camera
 {
@@ -49,24 +60,26 @@ HkCameraNode::HkCameraNode(const rclcpp::NodeOptions & options)
   use_transport_ = this->get_parameter("use_transport").as_bool();
   auto_reconnect_ = this->get_parameter("auto_reconnect").as_bool();
 
+  // Setup parameter callback first
+  parameter_callback_handle_ = this->add_on_set_parameters_callback(
+    std::bind(&HkCameraNode::parametersCallback, this, std::placeholders::_1));
+
   // Initialize camera
   if (!initCamera()) {
     RCLCPP_ERROR(this->get_logger(), "Failed to initialize camera");
+    // 设置节点为失败状态，不创建发布器和定时器
+    is_connected_ = false;
     return;
   }
 
-  // Setup image publisher
+  // Setup image publisher only after successful camera initialization
   image_publisher_ = this->create_publisher<sensor_msgs::msg::Image>(topic_name_, 1);
   
-  // Setup actual frame rate publisher
+  // Setup actual frame rate publisher only after successful camera initialization
   actual_frame_rate_publisher_ = this->create_publisher<std_msgs::msg::Float64>("~/actual_frame_rate", 10);
   
   // Image transport is disabled to avoid shared_from_this issues
   use_transport_ = false;
-
-  // Setup parameter callback
-  parameter_callback_handle_ = this->add_on_set_parameters_callback(
-    std::bind(&HkCameraNode::parametersCallback, this, std::placeholders::_1));
 
   RCLCPP_INFO(this->get_logger(), "HK Camera node initialized successfully");
 }
@@ -77,9 +90,7 @@ HkCameraNode::~HkCameraNode()
   if (image_thread_.joinable()) {
     image_thread_.join();
   }
-  if (frame_rate_thread_.joinable()) {
-    frame_rate_thread_.join();
-  }
+  // Timer is automatically destroyed when node is destroyed
   
   stopGrabbing();
   disconnectCamera();
@@ -181,8 +192,13 @@ bool HkCameraNode::initCamera()
   should_stop_ = false;
   image_thread_ = std::thread(&HkCameraNode::getImageCallback, this);
   
-  // Start frame rate monitoring thread
-  frame_rate_thread_ = std::thread(&HkCameraNode::frameRateMonitorCallback, this);
+  // Create timer for frame rate monitoring (1 Hz)
+  frame_rate_timer_ = this->create_wall_timer(
+    std::chrono::seconds(1),
+    std::bind(&HkCameraNode::frameRateTimerCallback, this));
+  
+  // Initialize frame rate calculation
+  last_time_ = std::chrono::steady_clock::now();
   
   return true;
 }
@@ -194,7 +210,37 @@ bool HkCameraNode::configureCamera()
   // Set pixel format
   nRet = MV_CC_SetEnumValueByString(device_handle_, "PixelFormat", pixel_format_.c_str());
   if (MV_OK != nRet) {
-    RCLCPP_WARN(this->get_logger(), "Set pixel format failed: %08x", nRet);
+    RCLCPP_WARN(this->get_logger(), "Set pixel format '%s' failed: %08x", pixel_format_.c_str(), nRet);
+    
+    // For color cameras, always try to set RGB8 first to avoid color issues
+  std::vector<std::string> color_formats = {"RGB8", "BGR8"};
+    
+    for (const auto& format : color_formats) {
+      nRet = MV_CC_SetEnumValueByString(device_handle_, "PixelFormat", format.c_str());
+      if (MV_OK == nRet) {
+        pixel_format_ = format;
+        RCLCPP_INFO(this->get_logger(), "Successfully set pixel format to: %s", format.c_str());
+        break;
+      }
+    }
+    
+    if (MV_OK != nRet) {
+      // If RGB8/BGR8 not supported, try Bayer formats
+      std::vector<std::string> bayer_formats = {"BayerRG8", "BayerBG8", "BayerGB8", "BayerGR8"};
+      for (const auto& format : bayer_formats) {
+        nRet = MV_CC_SetEnumValueByString(device_handle_, "PixelFormat", format.c_str());
+        if (MV_OK == nRet) {
+          pixel_format_ = format;
+          RCLCPP_INFO(this->get_logger(), "Using Bayer format: %s (will be converted to RGB8)", format.c_str());
+          break;
+        }
+      }
+    }
+    
+    if (MV_OK != nRet) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to set any pixel format");
+      return false;
+    }
   }
   
   // Set image size
@@ -286,10 +332,21 @@ bool HkCameraNode::disconnectCamera()
 void HkCameraNode::getImageCallback()
 {
   cv::Mat image;
+  int error_count = 0;
+  const int max_errors = 10;
   
   while (!should_stop_ && rclcpp::ok()) {
     if (getOneImage(image)) {
-      publishImage(image);
+      error_count = 0;  // Reset error count on success
+      if (!image.empty()) {
+        publishImage(image);
+      }
+    } else {
+      error_count++;
+      if (error_count >= max_errors) {
+        RCLCPP_ERROR(this->get_logger(), "Too many consecutive errors (%d), stopping image acquisition", max_errors);
+        break;
+      }
     }
     
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -329,6 +386,16 @@ bool HkCameraNode::getOneImage(cv::Mat & image)
     if (nRet == MV_E_GC_TIMEOUT) {
       // Timeout is normal when no image is available
       return false;
+    } else if (nRet == 0x80000007) {
+      // Buffer underrun or camera internal issue, try to recover
+      RCLCPP_WARN(this->get_logger(), "Camera buffer underrun (0x80000007), trying to recover...");
+      
+      // Try to flush the camera buffer
+      int flush_ret = MV_CC_ClearImageBuffer(device_handle_);
+      if (flush_ret == MV_OK) {
+        RCLCPP_INFO(this->get_logger(), "Camera buffer cleared successfully");
+      }
+      return false;
     } else {
       RCLCPP_WARN(this->get_logger(), "Get one frame failed: %08x", nRet);
       return false;
@@ -336,21 +403,61 @@ bool HkCameraNode::getOneImage(cv::Mat & image)
   }
   
   // Convert to OpenCV Mat
-  if (frame_info.enPixelType == PixelType_Gvsp_BGR8_Packed) {
-    image = cv::Mat(frame_info.nHeight, frame_info.nWidth, CV_8UC3, pData).clone();
-    RCLCPP_DEBUG(this->get_logger(), "BGR8 image: %dx%d, step: %zu", 
-                 image.cols, image.rows, image.step[0]);
-  } else if (frame_info.enPixelType == PixelType_Gvsp_RGB8_Packed) {
-    cv::Mat rgb_image(frame_info.nHeight, frame_info.nWidth, CV_8UC3, pData);
-    cv::cvtColor(rgb_image, image, cv::COLOR_RGB2BGR);
-    RCLCPP_DEBUG(this->get_logger(), "RGB8 converted to BGR8 image: %dx%d, step: %zu", 
-                 image.cols, image.rows, image.step[0]);
-  } else if (frame_info.enPixelType == PixelType_Gvsp_Mono8) {
-    image = cv::Mat(frame_info.nHeight, frame_info.nWidth, CV_8UC1, pData).clone();
-    RCLCPP_DEBUG(this->get_logger(), "Mono8 image: %dx%d, step: %zu", 
-                 image.cols, image.rows, image.step[0]);
-  } else {
-    RCLCPP_WARN(this->get_logger(), "Unsupported pixel format: %ld", frame_info.enPixelType);
+               
+  try {
+    if (frame_info.enPixelType == PixelType_Gvsp_BGR8_Packed) {
+      image = cv::Mat(frame_info.nHeight, frame_info.nWidth, CV_8UC3, pData).clone();
+      RCLCPP_DEBUG(this->get_logger(), "BGR8 image: %dx%d, step: %zu", 
+                   image.cols, image.rows, image.step[0]);
+    } else if (frame_info.enPixelType == PixelType_Gvsp_RGB8_Packed) {
+      cv::Mat rgb_image(frame_info.nHeight, frame_info.nWidth, CV_8UC3, pData);
+      cv::cvtColor(rgb_image, image, cv::COLOR_RGB2BGR);
+      RCLCPP_DEBUG(this->get_logger(), "RGB8 converted to BGR8 image: %dx%d, step: %zu", 
+                   image.cols, image.rows, image.step[0]);
+    } else if (frame_info.enPixelType == PixelType_Gvsp_Mono8) {
+      image = cv::Mat(frame_info.nHeight, frame_info.nWidth, CV_8UC1, pData).clone();
+      RCLCPP_DEBUG(this->get_logger(), "Mono8 image: %dx%d, step: %zu", 
+                   image.cols, image.rows, image.step[0]);
+    } else if (frame_info.enPixelType == PixelType_Gvsp_BayerRG8) {
+      cv::Mat bayer_image(frame_info.nHeight, frame_info.nWidth, CV_8UC1, pData);
+      // 先转换为BGR，然后手动交换R和B通道
+      cv::Mat bgr_image;
+      cv::cvtColor(bayer_image, bgr_image, cv::COLOR_BayerRG2BGR);
+      
+      // 创建RGB图像并交换通道
+      cv::Mat channels[3];
+      cv::split(bgr_image, channels);
+      // 交换R和B通道: BGR -> RGB
+      cv::Mat rgb_channels[3] = {channels[0], channels[1], channels[2]}; // B, G, R
+      cv::merge(rgb_channels, 3, image);
+      
+      
+    } else if (frame_info.enPixelType == PixelType_Gvsp_BayerBG8) {
+      cv::Mat bayer_image(frame_info.nHeight, frame_info.nWidth, CV_8UC1, pData);
+      cv::cvtColor(bayer_image, image, cv::COLOR_BayerBG2BGR);
+      RCLCPP_DEBUG(this->get_logger(), "BayerBG8 converted to BGR8 image: %dx%d, step: %zu", 
+                   image.cols, image.rows, image.step[0]);
+    } else if (frame_info.enPixelType == PixelType_Gvsp_BayerGB8) {
+      cv::Mat bayer_image(frame_info.nHeight, frame_info.nWidth, CV_8UC1, pData);
+      cv::cvtColor(bayer_image, image, cv::COLOR_BayerGB2BGR);
+      RCLCPP_DEBUG(this->get_logger(), "BayerGB8 converted to BGR8 image: %dx%d, step: %zu", 
+                   image.cols, image.rows, image.step[0]);
+    } else if (frame_info.enPixelType == PixelType_Gvsp_BayerGR8) {
+      cv::Mat bayer_image(frame_info.nHeight, frame_info.nWidth, CV_8UC1, pData);
+      cv::cvtColor(bayer_image, image, cv::COLOR_BayerGR2BGR);
+      RCLCPP_DEBUG(this->get_logger(), "BayerGR8 converted to BGR8 image: %dx%d, step: %zu", 
+                   image.cols, image.rows, image.step[0]);
+    } else {
+      RCLCPP_WARN(this->get_logger(), "Unsupported pixel format: %ld", frame_info.enPixelType);
+      free(pData);
+      return false;
+    }
+  } catch (const cv::Exception& e) {
+    RCLCPP_ERROR(this->get_logger(), "OpenCV exception: %s", e.what());
+    free(pData);
+    return false;
+  } catch (...) {
+    RCLCPP_ERROR(this->get_logger(), "Unknown exception during image conversion");
     free(pData);
     return false;
   }
@@ -366,6 +473,12 @@ void HkCameraNode::publishImage(const cv::Mat & image)
     return;
   }
   
+  // Increment frame counter for FPS calculation
+  {
+    std::lock_guard<std::mutex> lock(frame_rate_mutex_);
+    frame_count_++;
+  }
+  
   // Create image message manually to ensure correct step
   auto msg = std::make_unique<sensor_msgs::msg::Image>();
   msg->header.stamp = this->now();
@@ -374,8 +487,8 @@ void HkCameraNode::publishImage(const cv::Mat & image)
   msg->width = image.cols;
   
   if (image.type() == CV_8UC3) {
-    msg->encoding = "bgr8";
-    msg->step = image.cols * 3; // 3 bytes per pixel for BGR8
+    msg->encoding = "rgb8";
+    msg->step = image.cols * 3; // 3 bytes per pixel for RGB8
   } else if (image.type() == CV_8UC1) {
     msg->encoding = "mono8";
     msg->step = image.cols; // 1 byte per pixel for Mono8
@@ -510,23 +623,43 @@ double HkCameraNode::getCurrentFrameRate()
   return float_value.fCurValue;
 }
 
-void HkCameraNode::frameRateMonitorCallback()
+void HkCameraNode::frameRateTimerCallback()
 {
-  rclcpp::Rate rate(1.0); // 1 Hz
-  
-  while (!should_stop_ && rclcpp::ok()) {
-    if (is_connected_) {
-      double actual_fps = getActualFrameRate();
-      if (actual_fps > 0.0) {
-        auto msg = std::make_unique<std_msgs::msg::Float64>();
-        msg->data = actual_fps;
-        actual_frame_rate_publisher_->publish(std::move(msg));
-        
-        RCLCPP_DEBUG(this->get_logger(), "Published actual frame rate: %.2f fps", actual_fps);
-      }
-    }
+  if (is_connected_ && is_grabbing_ && actual_frame_rate_publisher_) {
+    // Calculate frame rate based on actual frame count
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(frame_rate_mutex_);
     
-    rate.sleep();
+    // Calculate time difference in seconds
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time_);
+    double time_diff = duration.count() / 1000.0;
+    
+    if (time_diff > 0.9) {  // Use 1 second intervals for more stable readings
+      // Calculate FPS
+      double instant_fps = frame_count_ / time_diff;
+      
+      // Apply simple low-pass filter to smooth out fluctuations
+      const double alpha = 0.3; // Smoothing factor (0.0 = no change, 1.0 = no smoothing)
+      calculated_fps_ = alpha * instant_fps + (1.0 - alpha) * calculated_fps_;
+      
+      // Reset counters
+      frame_count_ = 0;
+      last_time_ = now;
+      
+      // Publish calculated FPS
+      auto msg = std::make_unique<std_msgs::msg::Float64>();
+      msg->data = calculated_fps_;
+      actual_frame_rate_publisher_->publish(std::move(msg));
+      
+      RCLCPP_DEBUG(this->get_logger(), "Published calculated frame rate: %.2f fps (instant: %.2f)", 
+                   calculated_fps_, instant_fps);
+    }
+  } else if (!is_connected_ && actual_frame_rate_publisher_) {
+    // If camera is not connected, publish 0 fps
+    auto msg = std::make_unique<std_msgs::msg::Float64>();
+    msg->data = 0.0;
+    actual_frame_rate_publisher_->publish(std::move(msg));
+    RCLCPP_DEBUG(this->get_logger(), "Camera not connected, publishing 0 fps");
   }
 }
 
