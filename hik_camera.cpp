@@ -19,21 +19,20 @@
 
 using namespace std::chrono_literals;
 
-// 相机设备信息
 struct CameraInfo {
-    std::string serialNumber;
-    std::string modelName;
-    std::string ipAddress;
-    unsigned int deviceType;
+    std::string serialNumber;  
+    std::string modelName;     
+    std::string ipAddress;     
+    unsigned int deviceType;   
 };
 
-// 图像数据
+// 图像数据结构
 struct ImageData {
-    unsigned char *data;
-    unsigned int width;
-    unsigned int height;
-    unsigned int pixelFormat;
-    unsigned int dataSize;
+    unsigned char *data;       
+    unsigned int width;        
+    unsigned int height;       
+    unsigned int pixelFormat;  
+    unsigned int dataSize;     
     
     ImageData() : data(nullptr), width(0), height(0), pixelFormat(0), dataSize(0) {}
 };
@@ -239,13 +238,26 @@ public:
     }
 
     bool grab_image(ImageData &data, unsigned int timeout = 1000, unsigned int desired_format = 0) {
-        if (!is_grabbing_) return false;
+        if (!is_grabbing_) {
+            last_error_ = "相机未开始采集";
+            return false;
+        }
 
         MV_FRAME_OUT frame;
         memset(&frame, 0, sizeof(MV_FRAME_OUT));
 
         int ret = MV_CC_GetImageBuffer(handle_, &frame, timeout);
-        if (ret != MV_OK) return false;
+        if (ret != MV_OK) {
+            set_error("获取图像缓冲区失败", ret);
+            return false;
+        }
+
+        // 检查图像数据有效性
+        if (!frame.pBufAddr || frame.stFrameInfo.nWidth == 0 || frame.stFrameInfo.nHeight == 0) {
+            MV_CC_FreeImageBuffer(handle_, &frame);
+            last_error_ = "获取到无效图像数据";
+            return false;
+        }
 
         unsigned int width = frame.stFrameInfo.nWidth;
         unsigned int height = frame.stFrameInfo.nHeight;
@@ -253,14 +265,38 @@ public:
         unsigned int target_format = desired_format ? desired_format : src_format;
         bool need_convert = (target_format != src_format);
 
+        // 验证目标格式是否受支持
+        if (need_convert && !is_pixel_format_supported(target_format)) {
+            RCLCPP_WARN(rclcpp::get_logger("camera_driver"), 
+                       "目标像素格式 0x%08X 不受支持，使用原始格式", target_format);
+            target_format = src_format;
+            need_convert = false;
+        }
+
         size_t required_size = need_convert ? estimate_buffer_size(target_format, width, height) 
                                            : frame.stFrameInfo.nFrameLen;
-        if (required_size == 0) required_size = frame.stFrameInfo.nFrameLen;
+        if (required_size == 0) {
+            MV_CC_FreeImageBuffer(handle_, &frame);
+            last_error_ = "无法计算所需缓冲区大小";
+            return false;
+        }
 
+        // 智能缓冲区管理：避免频繁重新分配
         if (buffer_size_ < required_size) {
-            if (convert_buffer_) delete[] convert_buffer_;
-            convert_buffer_ = new unsigned char[required_size];
-            buffer_size_ = required_size;
+            if (convert_buffer_) {
+                delete[] convert_buffer_;
+                convert_buffer_ = nullptr;
+            }
+            try {
+                convert_buffer_ = new unsigned char[required_size];
+                buffer_size_ = required_size;
+                RCLCPP_DEBUG(rclcpp::get_logger("camera_driver"), 
+                           "分配新的转换缓冲区: %u 字节", buffer_size_);
+            } catch (const std::bad_alloc&) {
+                MV_CC_FreeImageBuffer(handle_, &frame);
+                last_error_ = "内存分配失败: 缓冲区大小 " + std::to_string(required_size);
+                return false;
+            }
         }
 
         if (need_convert) {
@@ -279,16 +315,24 @@ public:
             if (ret == MV_OK) {
                 data.pixelFormat = target_format;
                 data.data = convert_buffer_;
-                data.dataSize = required_size;
+                data.dataSize = convert_param.nDstLen;
             } else {
+                set_error("像素格式转换失败", ret);
                 MV_CC_FreeImageBuffer(handle_, &frame);
                 return false;
             }
         } else {
+            // 即使不需要转换，也复制到内部缓冲区以确保数据安全
             if (buffer_size_ < frame.stFrameInfo.nFrameLen) {
                 delete[] convert_buffer_;
-                convert_buffer_ = new unsigned char[frame.stFrameInfo.nFrameLen];
-                buffer_size_ = frame.stFrameInfo.nFrameLen;
+                try {
+                    convert_buffer_ = new unsigned char[frame.stFrameInfo.nFrameLen];
+                    buffer_size_ = frame.stFrameInfo.nFrameLen;
+                } catch (const std::bad_alloc&) {
+                    MV_CC_FreeImageBuffer(handle_, &frame);
+                    last_error_ = "内存分配失败";
+                    return false;
+                }
             }
             memcpy(convert_buffer_, frame.pBufAddr, frame.stFrameInfo.nFrameLen);
             data.pixelFormat = src_format;
@@ -299,6 +343,11 @@ public:
         data.width = width;
         data.height = height;
         MV_CC_FreeImageBuffer(handle_, &frame);
+        
+        RCLCPP_DEBUG(rclcpp::get_logger("camera_driver"), 
+                   "成功获取图像: %ux%u, 格式: 0x%08X, 大小: %u 字节", 
+                   data.width, data.height, data.pixelFormat, data.dataSize);
+        
         return true;
     }
 
@@ -379,18 +428,115 @@ public:
         if (!is_open_) return false;
         if (saved_pixel_format_ == format && format != 0) return true;
 
+        // 验证像素格式是否受支持
+        if (!is_pixel_format_supported(format)) {
+            last_error_ = "不支持的像素格式: 0x" + std::to_string(format);
+            return false;
+        }
+
         bool was_grabbing = is_grabbing_;
         if (was_grabbing) stop_grabbing();
 
         int ret = MV_CC_SetEnumValue(handle_, "PixelFormat", format);
         if (ret != MV_OK) {
+            set_error("设置像素格式失败", ret);
             if (was_grabbing) start_grabbing();
             return false;
         }
 
         saved_pixel_format_ = format;
         if (was_grabbing) start_grabbing();
+        
+        RCLCPP_INFO(rclcpp::get_logger("camera_driver"), "像素格式已设置为: 0x%08X", format);
         return true;
+    }
+    
+    // 检查像素格式是否受支持
+    bool is_pixel_format_supported(unsigned int format) const {
+        // 支持的像素格式列表
+        static const std::vector<unsigned int> supported_formats = {
+            PixelType_Gvsp_Mono8, PixelType_Gvsp_Mono10, PixelType_Gvsp_Mono12,
+            PixelType_Gvsp_Mono14, PixelType_Gvsp_Mono16,
+            PixelType_Gvsp_RGB8_Packed, PixelType_Gvsp_BGR8_Packed,
+            PixelType_Gvsp_RGB10_Packed, PixelType_Gvsp_BGR10_Packed,
+            PixelType_Gvsp_RGB12_Packed, PixelType_Gvsp_BGR12_Packed,
+            PixelType_Gvsp_RGB16_Packed, PixelType_Gvsp_BGR16_Packed,
+            PixelType_Gvsp_RGBA8_Packed, PixelType_Gvsp_BGRA8_Packed,
+            PixelType_Gvsp_YUV422_Packed, PixelType_Gvsp_YUV422_YUYV_Packed,
+            PixelType_Gvsp_BayerGR8, PixelType_Gvsp_BayerRG8,
+            PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerBG8,
+            PixelType_Gvsp_BayerGR10, PixelType_Gvsp_BayerRG10,
+            PixelType_Gvsp_BayerGB10, PixelType_Gvsp_BayerBG10,
+            PixelType_Gvsp_BayerGR12, PixelType_Gvsp_BayerRG12,
+            PixelType_Gvsp_BayerGB12, PixelType_Gvsp_BayerBG12,
+            PixelType_Gvsp_BayerGR16, PixelType_Gvsp_BayerRG16,
+            PixelType_Gvsp_BayerGB16, PixelType_Gvsp_BayerBG16
+        };
+        
+        return std::find(supported_formats.begin(), supported_formats.end(), format) != supported_formats.end();
+    }
+    
+    // 获取支持的像素格式列表
+    std::vector<unsigned int> get_supported_pixel_formats() const {
+        return {
+            PixelType_Gvsp_Mono8, PixelType_Gvsp_Mono10, PixelType_Gvsp_Mono12,
+            PixelType_Gvsp_Mono14, PixelType_Gvsp_Mono16,
+            PixelType_Gvsp_RGB8_Packed, PixelType_Gvsp_BGR8_Packed,
+            PixelType_Gvsp_RGB10_Packed, PixelType_Gvsp_BGR10_Packed,
+            PixelType_Gvsp_RGB12_Packed, PixelType_Gvsp_BGR12_Packed,
+            PixelType_Gvsp_RGB16_Packed, PixelType_Gvsp_BGR16_Packed,
+            PixelType_Gvsp_RGBA8_Packed, PixelType_Gvsp_BGRA8_Packed,
+            PixelType_Gvsp_YUV422_Packed, PixelType_Gvsp_YUV422_YUYV_Packed,
+            PixelType_Gvsp_BayerGR8, PixelType_Gvsp_BayerRG8,
+            PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerBG8,
+            PixelType_Gvsp_BayerGR10, PixelType_Gvsp_BayerRG10,
+            PixelType_Gvsp_BayerGB10, PixelType_Gvsp_BayerBG10,
+            PixelType_Gvsp_BayerGR12, PixelType_Gvsp_BayerRG12,
+            PixelType_Gvsp_BayerGB12, PixelType_Gvsp_BayerBG12,
+            PixelType_Gvsp_BayerGR16, PixelType_Gvsp_BayerRG16,
+            PixelType_Gvsp_BayerGB16, PixelType_Gvsp_BayerBG16
+        };
+    }
+    
+    // 获取像素格式的名称描述
+    std::string get_pixel_format_name(unsigned int format) const {
+        switch (format) {
+        case PixelType_Gvsp_Mono8: return "Mono8";
+        case PixelType_Gvsp_Mono10: return "Mono10";
+        case PixelType_Gvsp_Mono12: return "Mono12";
+        case PixelType_Gvsp_Mono14: return "Mono14";
+        case PixelType_Gvsp_Mono16: return "Mono16";
+        case PixelType_Gvsp_RGB8_Packed: return "RGB8";
+        case PixelType_Gvsp_BGR8_Packed: return "BGR8";
+        case PixelType_Gvsp_RGB10_Packed: return "RGB10";
+        case PixelType_Gvsp_BGR10_Packed: return "BGR10";
+        case PixelType_Gvsp_RGB12_Packed: return "RGB12";
+        case PixelType_Gvsp_BGR12_Packed: return "BGR12";
+        
+        case PixelType_Gvsp_RGB16_Packed: return "RGB16";
+        case PixelType_Gvsp_BGR16_Packed: return "BGR16";
+        case PixelType_Gvsp_RGBA8_Packed: return "RGBA8";
+        case PixelType_Gvsp_BGRA8_Packed: return "BGRA8";
+        case PixelType_Gvsp_YUV422_Packed: return "YUV422";
+        case PixelType_Gvsp_YUV422_YUYV_Packed: return "YUV422_YUYV";
+        case PixelType_Gvsp_BayerGR8: return "BayerGR8";
+        case PixelType_Gvsp_BayerRG8: return "BayerRG8";
+        case PixelType_Gvsp_BayerGB8: return "BayerGB8";
+        case PixelType_Gvsp_BayerBG8: return "BayerBG8";
+        case PixelType_Gvsp_BayerGR10: return "BayerGR10";
+        case PixelType_Gvsp_BayerRG10: return "BayerRG10";
+        case PixelType_Gvsp_BayerGB10: return "BayerGB10";
+        case PixelType_Gvsp_BayerBG10: return "BayerBG10";
+        case PixelType_Gvsp_BayerGR12: return "BayerGR12";
+        case PixelType_Gvsp_BayerRG12: return "BayerRG12";
+        case PixelType_Gvsp_BayerGB12: return "BayerGB12";
+        case PixelType_Gvsp_BayerBG12: return "BayerBG12";
+        case PixelType_Gvsp_BayerGR16: return "BayerGR16";
+        case PixelType_Gvsp_BayerRG16: return "BayerRG16";
+        case PixelType_Gvsp_BayerGB16: return "BayerGB16";
+        case PixelType_Gvsp_BayerBG16: return "BayerBG16";
+        default: return "Unknown";
+        }
     }
 
     bool is_open() const { return is_open_; }
@@ -453,10 +599,38 @@ private:
     size_t estimate_buffer_size(unsigned int format, unsigned int w, unsigned int h) {
         switch (format) {
         case PixelType_Gvsp_Mono8: return w * h;
+        case PixelType_Gvsp_Mono10:
+        case PixelType_Gvsp_Mono12:
+        case PixelType_Gvsp_Mono14:
+        case PixelType_Gvsp_Mono16: return w * h * 2;
         case PixelType_Gvsp_RGB8_Packed:
         case PixelType_Gvsp_BGR8_Packed: return w * h * 3;
+        case PixelType_Gvsp_RGB10_Packed:
+        case PixelType_Gvsp_BGR10_Packed:
+        case PixelType_Gvsp_RGB12_Packed:
+        case PixelType_Gvsp_BGR12_Packed:
+        case PixelType_Gvsp_RGB16_Packed:
+        case PixelType_Gvsp_BGR16_Packed: return w * h * 6;
         case PixelType_Gvsp_RGBA8_Packed:
         case PixelType_Gvsp_BGRA8_Packed: return w * h * 4;
+        case PixelType_Gvsp_YUV422_Packed:
+        case PixelType_Gvsp_YUV422_YUYV_Packed: return w * h * 2;
+        case PixelType_Gvsp_BayerGR8:
+        case PixelType_Gvsp_BayerRG8:
+        case PixelType_Gvsp_BayerGB8:
+        case PixelType_Gvsp_BayerBG8: return w * h;
+        case PixelType_Gvsp_BayerGR10:
+        case PixelType_Gvsp_BayerRG10:
+        case PixelType_Gvsp_BayerGB10:
+        case PixelType_Gvsp_BayerBG10:
+        case PixelType_Gvsp_BayerGR12:
+        case PixelType_Gvsp_BayerRG12:
+        case PixelType_Gvsp_BayerGB12:
+        case PixelType_Gvsp_BayerBG12:
+        case PixelType_Gvsp_BayerGR16:
+        case PixelType_Gvsp_BayerRG16:
+        case PixelType_Gvsp_BayerGB16:
+        case PixelType_Gvsp_BayerBG16: return w * h * 2;
         default: return w * h * 3;
         }
     }
@@ -549,6 +723,15 @@ public:
                 } else if (p.get_name() == "pixel_format_code") {
                     int v = p.as_int();
                     unsigned int previous = pixel_format_;
+                    
+                    // 验证像素格式是否受支持
+                    if (!camera_.is_pixel_format_supported(v)) {
+                        result.successful = false;
+                        if (!reason.str().empty()) reason << "; ";
+                        reason << "像素格式 0x" << std::hex << v << " 不受支持";
+                        continue;
+                    }
+                    
                     if (!camera_.set_pixel_format(v)) {
                         result.successful = false;
                         pixel_format_ = previous;
@@ -556,6 +739,7 @@ public:
                         reason << "像素格式设置失败: " << camera_.get_last_error();
                     } else {
                         pixel_format_ = v;
+                        RCLCPP_INFO(get_logger(), "像素格式已更新为: 0x%08X", v);
                     }
                 } else if (p.get_name() == "camera_frame") {
                     frame_id_ = p.as_string();
@@ -664,21 +848,53 @@ private:
         if (!img.data || !img.width || !img.height) return;
 
         std::string encoding = to_encoding(img.pixelFormat);
-        cv::Mat frame(img.height, img.width, CV_8UC1, img.data);
+        cv::Mat frame;
+        
+        // 根据像素格式创建对应的Mat对象
+        if (encoding == sensor_msgs::image_encodings::MONO16 ||
+            encoding == sensor_msgs::image_encodings::RGB16) {
+            frame = cv::Mat(img.height, img.width, CV_16UC1, img.data);
+        } else {
+            frame = cv::Mat(img.height, img.width, CV_8UC1, img.data);
+        }
 
+        // Bayer格式去马赛克处理
         if (sensor_msgs::image_encodings::isBayer(encoding)) {
             cv::Mat rgb;
-            if (encoding == sensor_msgs::image_encodings::BAYER_RGGB8) {
+            
+            // 根据不同的Bayer模式选择对应的去马赛克算法
+            if (encoding == sensor_msgs::image_encodings::BAYER_RGGB8 ||
+                encoding == sensor_msgs::image_encodings::BAYER_RGGB16) {
                 cv::demosaicing(frame, rgb, cv::COLOR_BayerRG2RGB);
-            } else if (encoding == sensor_msgs::image_encodings::BAYER_GRBG8) {
+            } else if (encoding == sensor_msgs::image_encodings::BAYER_GRBG8 ||
+                       encoding == sensor_msgs::image_encodings::BAYER_GRBG16) {
                 cv::demosaicing(frame, rgb, cv::COLOR_BayerGR2RGB);
-            } else if (encoding == sensor_msgs::image_encodings::BAYER_GBRG8) {
+            } else if (encoding == sensor_msgs::image_encodings::BAYER_GBRG8 ||
+                       encoding == sensor_msgs::image_encodings::BAYER_GBRG16) {
                 cv::demosaicing(frame, rgb, cv::COLOR_BayerGB2RGB);
-            } else {
+            } else if (encoding == sensor_msgs::image_encodings::BAYER_BGGR8 ||
+                       encoding == sensor_msgs::image_encodings::BAYER_BGGR16) {
                 cv::demosaicing(frame, rgb, cv::COLOR_BayerBG2RGB);
+            } else {
+                RCLCPP_WARN(get_logger(), "未知Bayer格式: %s，使用默认RGGB模式", encoding.c_str());
+                cv::demosaicing(frame, rgb, cv::COLOR_BayerRG2RGB);
             }
+            
+            frame = rgb;
+            // 更新编码格式为RGB格式
+            encoding = (encoding.find("16") != std::string::npos) ? 
+                       sensor_msgs::image_encodings::RGB16 : 
+                       sensor_msgs::image_encodings::RGB8;
+            RCLCPP_DEBUG(get_logger(), "Bayer图像已转换为RGB格式: %s", encoding.c_str());
+        }
+        
+        // YUV422格式转换
+        else if (encoding == sensor_msgs::image_encodings::YUV422) {
+            cv::Mat rgb;
+            cv::cvtColor(frame, rgb, cv::COLOR_YUV2RGB_YUYV);
             frame = rgb;
             encoding = sensor_msgs::image_encodings::RGB8;
+            RCLCPP_DEBUG(get_logger(), "YUV422图像已转换为RGB格式");
         }
 
         auto header = std_msgs::msg::Header();
@@ -714,7 +930,17 @@ private:
         if (frame_rate_ > 0.0) {
             try_set("帧率", camera_.set_frame_rate(frame_rate_));
         }
-        try_set("像素格式", camera_.set_pixel_format(pixel_format_));
+        if (camera_.is_pixel_format_supported(pixel_format_)) {
+            try_set("像素格式", camera_.set_pixel_format(pixel_format_));
+        } else {
+            RCLCPP_WARN(get_logger(), "像素格式 0x%08X 不受支持，使用默认格式", pixel_format_);
+            // 尝试设置一个默认的受支持格式
+            unsigned int default_format = PixelType_Gvsp_BayerRG8;
+            if (camera_.set_pixel_format(default_format)) {
+                pixel_format_ = default_format;
+                RCLCPP_INFO(get_logger(), "已使用默认像素格式: 0x%08X", default_format);
+            }
+        }
         
         settings_applied_ = ok;
     }
@@ -722,12 +948,42 @@ private:
     std::string to_encoding(unsigned int format) const {
         switch (format) {
         case PixelType_Gvsp_Mono8: return sensor_msgs::image_encodings::MONO8;
+        case PixelType_Gvsp_Mono10:
+        case PixelType_Gvsp_Mono12:
+        case PixelType_Gvsp_Mono14:
+        case PixelType_Gvsp_Mono16: return sensor_msgs::image_encodings::MONO16;
         case PixelType_Gvsp_RGB8_Packed: return sensor_msgs::image_encodings::RGB8;
         case PixelType_Gvsp_BGR8_Packed: return sensor_msgs::image_encodings::BGR8;
+        case PixelType_Gvsp_RGB10_Packed:
+        case PixelType_Gvsp_BGR10_Packed:
+        case PixelType_Gvsp_RGB12_Packed:
+        case PixelType_Gvsp_BGR12_Packed:
+        case PixelType_Gvsp_RGB16_Packed:
+        case PixelType_Gvsp_BGR16_Packed: return sensor_msgs::image_encodings::RGB16;
         case PixelType_Gvsp_RGBA8_Packed: return sensor_msgs::image_encodings::RGBA8;
         case PixelType_Gvsp_BGRA8_Packed: return sensor_msgs::image_encodings::BGRA8;
+        case PixelType_Gvsp_YUV422_Packed:
+        case PixelType_Gvsp_YUV422_YUYV_Packed: return sensor_msgs::image_encodings::YUV422;
+        case PixelType_Gvsp_BayerGR8: return sensor_msgs::image_encodings::BAYER_GRBG8;
         case PixelType_Gvsp_BayerRG8: return sensor_msgs::image_encodings::BAYER_RGGB8;
-        default: return sensor_msgs::image_encodings::BAYER_RGGB8;
+        case PixelType_Gvsp_BayerGB8: return sensor_msgs::image_encodings::BAYER_GBRG8;
+        case PixelType_Gvsp_BayerBG8: return sensor_msgs::image_encodings::BAYER_BGGR8;
+        case PixelType_Gvsp_BayerGR10:
+        case PixelType_Gvsp_BayerRG10:
+        case PixelType_Gvsp_BayerGB10:
+        case PixelType_Gvsp_BayerBG10:
+        case PixelType_Gvsp_BayerGR12:
+        case PixelType_Gvsp_BayerRG12:
+        case PixelType_Gvsp_BayerGB12:
+        case PixelType_Gvsp_BayerBG12:
+        case PixelType_Gvsp_BayerGR16:
+        case PixelType_Gvsp_BayerRG16:
+        case PixelType_Gvsp_BayerGB16:
+        case PixelType_Gvsp_BayerBG16: return sensor_msgs::image_encodings::BAYER_RGGB16;
+        default: 
+            RCLCPP_WARN_ONCE(rclcpp::get_logger("camera_driver"), 
+                           "未知像素格式 0x%08X，使用默认格式 BAYER_RGGB8", format);
+            return sensor_msgs::image_encodings::BAYER_RGGB8;
         }
     }
 
