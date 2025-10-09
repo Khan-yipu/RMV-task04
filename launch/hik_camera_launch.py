@@ -17,10 +17,29 @@ def generate_launch_description():
     
     default_config_path = Path(config_dir) / "config" / "hik_camera_params.yaml"
 
-    config_argument = DeclareLaunchArgument(
-        name='config_path',
-        default_value=str(default_config_path),
-        description='Configuration file path for camera parameters'
+    # 相机参数声明
+    exposure_arg = DeclareLaunchArgument(
+        name='exposure',
+        default_value='4000.0',
+        description='Exposure time in microseconds'
+    )
+    
+    gain_arg = DeclareLaunchArgument(
+        name='image_gain',
+        default_value='16.9807',
+        description='Image gain value'
+    )
+    
+    fps_arg = DeclareLaunchArgument(
+        name='fps',
+        default_value='165.0',
+        description='Frame rate setting'
+    )
+    
+    trigger_arg = DeclareLaunchArgument(
+        name='use_trigger',
+        default_value='false',
+        description='Enable trigger mode'
     )
     
     rviz_flag = DeclareLaunchArgument(
@@ -40,7 +59,15 @@ def generate_launch_description():
         executable='hik_camera_node',
         name='camera_driver',
         output='screen',
-        parameters=[LaunchConfiguration('config_path')]
+        parameters=[{
+            'exposure': LaunchConfiguration('exposure'),
+            'image_gain': LaunchConfiguration('image_gain'),
+            'fps': LaunchConfiguration('fps'),
+            'use_trigger': LaunchConfiguration('use_trigger'),
+            'pixel_format_code': 17301513,
+            'camera_frame': 'camera_optical_frame',
+            'serial_number': ''
+        }]
     )
 
     rviz_visualizer = Node(
@@ -53,7 +80,10 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        config_argument,
+        exposure_arg,
+        gain_arg,
+        fps_arg,
+        trigger_arg,
         rviz_flag,
         rviz_config_argument,
         camera_driver,
