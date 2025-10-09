@@ -47,6 +47,8 @@ source install/setup.bash
 ros2 launch hik_camera hik_camera_launch.py
 ```
 
+我运行保存的一些图片放在了`img/`。
+
 使用自定义配置文件：
 
 ```bash
@@ -101,6 +103,8 @@ ros2 param set /camera_driver fps 120.0
 - **节点名称**: `camera_driver`
 - **发布话题**: `/image_raw` (sensor_msgs/Image)
 - **参数服务**: 支持动态参数配置
+
+
 
 
 
