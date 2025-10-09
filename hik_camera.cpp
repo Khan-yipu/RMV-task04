@@ -420,7 +420,7 @@ public:
         if (!is_open_) return 0.0f;
         MVCC_FLOATVALUE value;
         if (MV_CC_GetFloatValue(handle_, "ResultingFrameRate", &value) == MV_OK) return value.fCurValue;
-        if (MV_CC_GetFloatValue(handle_, "AcquisitionFrameRate", &value) == MV_OK) return value.fCurValue;
+        //if (MV_CC_GetFloatValue(handle_, "AcquisitionFrameRate", &value) == MV_OK) return value.fCurValue;
         return 0.0f;
     }
 
