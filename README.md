@@ -1,120 +1,107 @@
-# HK Camera ROS2 Driver
+# Hikvision 相机 ROS 2 驱动
 
-这个包提供了一个用于Hikvision相机的ROS2驱动程序，支持MVS SDK 4.6。
+这是一个用于海康威视工业相机的 ROS 2 软件包，提供图像采集和参数控制功能。
 
 ## 功能特性
 
-- 自动发现和连接Hikvision相机（GigE/USB）
-- 相机断开后自动重连
-- 高帧率稳定图像采集
-- 图像格式转换（sensor_msgs/msg/Image）
-- 发布到可配置的话题（默认：/image_raw）
-- 动态参数配置（曝光时间、增益、帧率、像素格式）
-- **读取当前实际帧率，发布实际帧率到~/actual_frame_rate话题**
+- 支持海康威视 GigE 和 USB 相机
+- 实时图像采集和发布
+- 可配置的相机参数（曝光、增益、帧率等）
+- 支持触发模式
+- 自动重连机制
+- RViz 可视化支持
 
-### 实际帧率读取
+## 安装依赖
 
-驱动程序现在可以读取相机的实际帧率，这与设定的帧率不同。实际帧率是相机当前真正达到的帧率，可能会受到曝光时间、图像大小等因素的影响。
-
-#### 相关API
-
-- `getActualFrameRate()`: 获取相机的实际帧率
-- `getCurrentFrameRate()`: 获取当前设定的帧率
-
-#### 话题
-
-- `~/actual_frame_rate` (std_msgs/Float64): 发布实际帧率，频率1Hz
-
-## 参数配置
-
-| 参数名 | 类型 | 默认值 | 描述 |
-|--------|------|--------|------|
-| device_ip | string | "" | 指定相机IP地址（GigE相机） |
-| device_serial | string | "" | 指定相机序列号（USB相机） |
-| camera_name | string | "hk_camera" | 相机名称 |
-| frame_id | string | "camera_link" | 图像帧ID |
-| topic_name | string | "image_raw" | 图像话题名称 |
-| exposure_time | double | 8000.0 | 曝光时间（微秒） |
-| gain | double | 1.0 | 增益 |
-| frame_rate | double | 30.0 | 设定帧率（fps） |
-| pixel_format | string | "BGR8" | 像素格式（Mono8/BGR8/RGB8） |
-| image_width | int | 1920 | 图像宽度 |
-| image_height | int | 1080 | 图像高度 |
-| auto_reconnect | bool | true | 自动重连 |
-
-## 编译
-首先将仓库克隆到自己工作区的`src/`目录下，例如`path/to/camera_ws/src/`
+确保已安装 ROS 2 Humble 以及海康相机的 SDK（通常安装在`opt/MVS/`），然后安装依赖：
 
 ```bash
-cd /path/to/camera_ws
-colcon build --packages-select hk_camera
+sudo apt install ros-humble-cv-bridge ros-humble-image-transport
+```
+
+或：
+如果想方便地安装 ROS 2, 一个比较方便的办法是借助于fishros 的一键安装命令：
+```bash
+wget http://fishros.com/install -O fishros && . fishros
+```
+
+或者使用`rosdep`:
+```bash
+rosdep install --from-paths src --ignore-src -y
+```
+
+## 构建
+
+把该项目克隆到工作空间的`src`目录下面，如`example_path/example_ws/src/`。然后在`example_ws`目录下运行：
+
+```bash
+colcon build --packages-select hik_camera
 source install/setup.bash
 ```
 
-
 ## 使用方法
 
-### 1. 启动相机节点
+### 启动相机节点：
 
 ```bash
-# 使用默认配置
-ros2 launch hk_camera camera.launch.py
-
-# 指定相机IP
-ros2 launch hk_camera camera.launch.py device_ip:=192.168.1.100
-
-# 指定相机序列号（USB相机）
-ros2 launch hk_camera camera.launch.py device_serial:=XXXXXXXXXX
-
-# 自定义参数
-ros2 launch hk_camera camera.launch.py frame_rate:=60.0 exposure_time:=5000.0
+ros2 launch hik_camera hik_camera_launch.py
 ```
 
-### 2. 查看图像
+使用自定义配置文件：
 
 ```bash
-ros2 run rqt_image_view rqt_image_view
-
-# 或者使用rviz2
-rviz2
+ros2 launch hik_camera hik_camera_launch.py config_path:=/path/to/your/config.yaml
 ```
 
-使用rviz2 在界面中应该能看到类似于这样的输出
-![rviz2](./rviz2_output.jpg)
+## 参数配置
 
-### 3. 监控实际帧率
+### 配置文件方式
+编辑 `config/hik_camera_params.yaml` 文件：
 
+```yaml
+camera_driver:
+  ros__parameters:
+    exposure: 4000.0        # 曝光时间（微秒）
+    image_gain: 16.9807     # 图像增益
+    use_trigger: false      # 是否启用触发模式
+    fps: 165.0              # 帧率设置
+    pixel_format_code: 17301513  # 像素格式代码
+    camera_frame: "camera_optical_frame"  # 坐标系名称
+    serial_number: ""       # 可选：通过序列号指定相机
+```
+
+### 命令行参数覆盖
+启动时动态设置参数：
 ```bash
-ros2 topic echo /hk_camera_node/actual_frame_rate
+# 设置曝光时间
+ros2 launch hik_camera hik_camera_launch.py exposure:=8000.0
+
+# 设置帧率和增益
+ros2 launch hik_camera hik_camera_launch.py fps:=30.0 image_gain:=10.0
+
+# 使用自定义配置文件
+ros2 launch hik_camera hik_camera_launch.py config_path:=/path/to/custom_params.yaml
 ```
 
-### 4. 动态调整参数
-
+### 运行时动态调整
 ```bash
-# 调整曝光时间
-ros2 param set /hk_camera_node exposure_time 10000.0
+# 查看当前参数
+ros2 param list /camera_driver
 
-# 调整增益
-ros2 param set /hk_camera_node gain 2.0
+# 获取参数值
+ros2 param get /camera_driver exposure
 
-# 调整帧率
-ros2 param set /hk_camera_node frame_rate 60.0
+# 设置参数
+ros2 param set /camera_driver exposure 6000.0
+ros2 param set /camera_driver fps 120.0
 ```
 
-## 话题
+## 节点信息
 
-| 话题名 | 类型 | 描述 |
-|--------|------|------|
-| /image_raw | sensor_msgs/Image | 图像数据 |
-| ~/actual_frame_rate | std_msgs/Float64 | 实际帧率（新增） |
+- **节点名称**: `camera_driver`
+- **发布话题**: `/image_raw` (sensor_msgs/Image)
+- **参数服务**: 支持动态参数配置
 
 
-## 注意事项
 
-1. 确保已安装Hikvision MVS SDK 4.6并正确配置环境变量
-2. 相机实际帧率可能会受到以下因素影响：
-   - 曝光时间（曝光时间过长会降低帧率）
-   - 图像大小（分辨率越高，帧率可能越低）
-   - 网络带宽（GigE相机）
-   - USB带宽（USB相机）
 

@@ -1,0 +1,759 @@
+#include "PixelType.h"
+#include "MvCameraControl.h"
+#include "cv_bridge/cv_bridge.h"
+#include "rcl_interfaces/msg/set_parameters_result.hpp"
+#include "sensor_msgs/image_encodings.hpp"
+#include "sensor_msgs/msg/image.hpp"
+#include <rclcpp/rclcpp.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <iomanip>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+using namespace std::chrono_literals;
+
+// 相机设备信息
+struct CameraInfo {
+    std::string serialNumber;
+    std::string modelName;
+    std::string ipAddress;
+    unsigned int deviceType;
+};
+
+// 图像数据
+struct ImageData {
+    unsigned char *data;
+    unsigned int width;
+    unsigned int height;
+    unsigned int pixelFormat;
+    unsigned int dataSize;
+    
+    ImageData() : data(nullptr), width(0), height(0), pixelFormat(0), dataSize(0) {}
+};
+
+// 海康相机控制类
+class CameraControl {
+public:
+    // 构造函数，初始化所有成员变量
+    CameraControl() : handle_(nullptr), is_open_(false), is_grabbing_(false), 
+                     convert_buffer_(nullptr), buffer_size_(0), device_index_(0),
+                     saved_exposure_(0.0f), saved_gain_(0.0f), saved_trigger_(false),
+                     saved_frame_rate_(0.0f), saved_pixel_format_(0) {}
+
+    ~CameraControl() {
+        if (is_grabbing_) stop_grabbing();
+        if (is_open_) close();
+        if (convert_buffer_) delete[] convert_buffer_;
+    }
+
+    // 获取最后的错误信息
+    std::string get_last_error() const {
+        return last_error_;
+    }
+
+    // 重连相机
+    bool reconnect(unsigned int index, int max_retries = 5, int retry_delay_ms = 1000) {
+        device_index_ = index;
+        
+        for (int attempt = 1; attempt <= max_retries && !is_open_; ++attempt) {
+            if (is_grabbing_) stop_grabbing();
+            if (is_open_) close();
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms * attempt));
+            
+            if (!open(index)) continue;
+            
+            // 恢复设置
+            if (saved_exposure_ > 0.0f) set_exposure(saved_exposure_);
+            if (saved_gain_ > 0.0f) set_gain(saved_gain_);
+            if (saved_frame_rate_ > 0.0f) set_frame_rate(saved_frame_rate_);
+            if (saved_pixel_format_ > 0) set_pixel_format(saved_pixel_format_);
+            set_trigger_mode(saved_trigger_);
+            
+            if (!start_grabbing()) {
+                close();
+                continue;
+            }
+            
+            return true;
+        }
+        return false;
+    }
+
+    // 软件触发
+    bool trigger_software() {
+        if (!is_open_) return false;
+        int ret = MV_CC_SetCommandValue(handle_, "TriggerSoftware");
+        return ret == MV_OK;
+    }
+
+    // 获取图像宽度
+    unsigned int get_width() {
+        if (!is_open_) return 0;
+        MVCC_INTVALUE value;
+        return MV_CC_GetIntValue(handle_, "Width", &value) == MV_OK ? value.nCurValue : 0;
+    }
+
+    // 获取图像高度
+    unsigned int get_height() {
+        if (!is_open_) return 0;
+        MVCC_INTVALUE value;
+        return MV_CC_GetIntValue(handle_, "Height", &value) == MV_OK ? value.nCurValue : 0;
+    }
+
+    static std::vector<CameraInfo> enumerate_devices() {
+        std::vector<CameraInfo> devices;
+        MV_CC_DEVICE_INFO_LIST device_list;
+        memset(&device_list, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+
+        int ret = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &device_list);
+        if (ret != MV_OK) return devices;
+
+        for (unsigned int i = 0; i < device_list.nDeviceNum; i++) {
+            MV_CC_DEVICE_INFO *info = device_list.pDeviceInfo[i];
+            if (!info) continue;
+
+            CameraInfo cam_info;
+            cam_info.deviceType = info->nTLayerType;
+
+            if (info->nTLayerType == MV_GIGE_DEVICE) {
+                auto *gige_info = &info->SpecialInfo.stGigEInfo;
+                cam_info.serialNumber = std::string((char *)gige_info->chSerialNumber);
+                cam_info.modelName = std::string((char *)gige_info->chModelName);
+                
+                unsigned int ip = gige_info->nCurrentIp;
+                std::ostringstream oss;
+                oss << ((ip & 0xFF000000) >> 24) << "." << ((ip & 0x00FF0000) >> 16) 
+                    << "." << ((ip & 0x0000FF00) >> 8) << "." << (ip & 0x000000FF);
+                cam_info.ipAddress = oss.str();
+            } else if (info->nTLayerType == MV_USB_DEVICE) {
+                auto *usb_info = &info->SpecialInfo.stUsb3VInfo;
+                cam_info.serialNumber = std::string((char *)usb_info->chSerialNumber);
+                cam_info.modelName = std::string((char *)usb_info->chModelName);
+                cam_info.ipAddress = "USB";
+            }
+            devices.push_back(cam_info);
+        }
+        return devices;
+    }
+
+    // 打开指定索引的相机设备
+    bool open(unsigned int index = 0) {
+        if (is_open_) {
+            last_error_ = "Camera is already open";
+            return false;
+        }
+
+        MV_CC_DEVICE_INFO_LIST device_list;
+        memset(&device_list, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+
+        // 重新扫描设备列表
+        int ret = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &device_list);
+        if (ret != MV_OK) {
+            set_error("Enumerate devices failed", ret);
+            return false;
+        }
+        if (index >= device_list.nDeviceNum) {
+            last_error_ = "Invalid device index";
+            return false;
+        }
+
+        // 创建设备句柄
+        ret = MV_CC_CreateHandle(&handle_, device_list.pDeviceInfo[index]);
+        if (ret != MV_OK) {
+            set_error("Create handle failed", ret);
+            return false;
+        }
+
+        // 打开设备
+        ret = MV_CC_OpenDevice(handle_);
+        if (ret != MV_OK) {
+            set_error("Open device failed", ret);
+            MV_CC_DestroyHandle(handle_);
+            handle_ = nullptr;
+            return false;
+        }
+
+        // 设置触发模式为关闭（连续采集模式）
+        ret = MV_CC_SetEnumValue(handle_, "TriggerMode", 0);
+        if (ret != MV_OK) {
+            set_error("Set trigger mode failed", ret);
+        }
+        
+        is_open_ = true;
+        device_index_ = index;
+        return true;
+    }
+
+    bool close() {
+        if (!is_open_) return true;
+        if (is_grabbing_) stop_grabbing();
+        
+        int ret = MV_CC_CloseDevice(handle_);
+        if (ret != MV_OK) {
+            set_error("Close device failed", ret);
+        }
+        
+        ret = MV_CC_DestroyHandle(handle_);
+        if (ret != MV_OK) {
+            set_error("Destroy handle failed", ret);
+        }
+        
+        handle_ = nullptr;
+        is_open_ = false;
+        return true;
+    }
+
+    bool start_grabbing() {
+        if (!is_open_) {
+            last_error_ = "Camera is not open";
+            return false;
+        }
+        if (is_grabbing_) return true;
+        
+        int ret = MV_CC_StartGrabbing(handle_);
+        if (ret != MV_OK) {
+            set_error("Start grabbing failed", ret);
+            return false;
+        }
+        is_grabbing_ = true;
+        return true;
+    }
+
+    bool stop_grabbing() {
+        if (!is_grabbing_) return true;
+        int ret = MV_CC_StopGrabbing(handle_);
+        if (ret != MV_OK) {
+            set_error("Stop grabbing failed", ret);
+            return false;
+        }
+        is_grabbing_ = false;
+        return true;
+    }
+
+    bool grab_image(ImageData &data, unsigned int timeout = 1000, unsigned int desired_format = 0) {
+        if (!is_grabbing_) return false;
+
+        MV_FRAME_OUT frame;
+        memset(&frame, 0, sizeof(MV_FRAME_OUT));
+
+        int ret = MV_CC_GetImageBuffer(handle_, &frame, timeout);
+        if (ret != MV_OK) return false;
+
+        unsigned int width = frame.stFrameInfo.nWidth;
+        unsigned int height = frame.stFrameInfo.nHeight;
+        unsigned int src_format = frame.stFrameInfo.enPixelType;
+        unsigned int target_format = desired_format ? desired_format : src_format;
+        bool need_convert = (target_format != src_format);
+
+        size_t required_size = need_convert ? estimate_buffer_size(target_format, width, height) 
+                                           : frame.stFrameInfo.nFrameLen;
+        if (required_size == 0) required_size = frame.stFrameInfo.nFrameLen;
+
+        if (buffer_size_ < required_size) {
+            if (convert_buffer_) delete[] convert_buffer_;
+            convert_buffer_ = new unsigned char[required_size];
+            buffer_size_ = required_size;
+        }
+
+        if (need_convert) {
+            MV_CC_PIXEL_CONVERT_PARAM convert_param;
+            memset(&convert_param, 0, sizeof(MV_CC_PIXEL_CONVERT_PARAM));
+            convert_param.nWidth = width;
+            convert_param.nHeight = height;
+            convert_param.pSrcData = frame.pBufAddr;
+            convert_param.nSrcDataLen = frame.stFrameInfo.nFrameLen;
+            convert_param.enSrcPixelType = static_cast<MvGvspPixelType>(src_format);
+            convert_param.enDstPixelType = static_cast<MvGvspPixelType>(target_format);
+            convert_param.pDstBuffer = convert_buffer_;
+            convert_param.nDstBufferSize = buffer_size_;
+
+            ret = MV_CC_ConvertPixelType(handle_, &convert_param);
+            if (ret == MV_OK) {
+                data.pixelFormat = target_format;
+                data.data = convert_buffer_;
+                data.dataSize = required_size;
+            } else {
+                MV_CC_FreeImageBuffer(handle_, &frame);
+                return false;
+            }
+        } else {
+            if (buffer_size_ < frame.stFrameInfo.nFrameLen) {
+                delete[] convert_buffer_;
+                convert_buffer_ = new unsigned char[frame.stFrameInfo.nFrameLen];
+                buffer_size_ = frame.stFrameInfo.nFrameLen;
+            }
+            memcpy(convert_buffer_, frame.pBufAddr, frame.stFrameInfo.nFrameLen);
+            data.pixelFormat = src_format;
+            data.data = convert_buffer_;
+            data.dataSize = frame.stFrameInfo.nFrameLen;
+        }
+
+        data.width = width;
+        data.height = height;
+        MV_CC_FreeImageBuffer(handle_, &frame);
+        return true;
+    }
+
+    bool set_exposure(float exposure) {
+        if (!is_open_) {
+            last_error_ = "Camera is not open";
+            return false;
+        }
+        int ret = MV_CC_SetFloatValue(handle_, "ExposureTime", exposure);
+        if (ret != MV_OK) {
+            set_error("Set exposure time failed", ret);
+            return false;
+        }
+        saved_exposure_ = exposure;
+        return true;
+    }
+
+    float get_exposure() {
+        if (!is_open_) return 0.0f;
+        MVCC_FLOATVALUE value;
+        return MV_CC_GetFloatValue(handle_, "ExposureTime", &value) == MV_OK ? value.fCurValue : 0.0f;
+    }
+
+    bool set_gain(float gain) {
+        if (!is_open_) return false;
+        int ret = MV_CC_SetFloatValue(handle_, "Gain", gain);
+        if (ret != MV_OK) return false;
+        saved_gain_ = gain;
+        return true;
+    }
+
+    float get_gain() {
+        if (!is_open_) return 0.0f;
+        MVCC_FLOATVALUE value;
+        return MV_CC_GetFloatValue(handle_, "Gain", &value) == MV_OK ? value.fCurValue : 0.0f;
+    }
+
+    bool set_trigger_mode(bool enable) {
+        if (!is_open_) return false;
+        int ret = MV_CC_SetEnumValue(handle_, "TriggerMode", enable ? 1 : 0);
+        if (ret != MV_OK) return false;
+        saved_trigger_ = enable;
+        return true;
+    }
+
+    bool set_frame_rate(float fps) {
+        if (!is_open_) return false;
+        if (fps <= 0.0f) return false;
+
+        MV_CC_SetBoolValue(handle_, "AcquisitionFrameRateEnable", true);
+        MV_CC_SetEnumValue(handle_, "AcquisitionFrameRateAuto", 0);
+        
+        int ret = MV_CC_SetFloatValue(handle_, "AcquisitionFrameRate", fps);
+        if (ret != MV_OK) {
+            MVCC_FLOATVALUE limits;
+            if (MV_CC_GetFloatValue(handle_, "AcquisitionFrameRate", &limits) == MV_OK) {
+                float clamped = std::clamp(fps, limits.fMin, limits.fMax);
+                ret = MV_CC_SetFloatValue(handle_, "AcquisitionFrameRate", clamped);
+            }
+        }
+        
+        if (ret == MV_OK) {
+            saved_frame_rate_ = fps;
+            return true;
+        }
+        return false;
+    }
+
+    float get_frame_rate() {
+        if (!is_open_) return 0.0f;
+        MVCC_FLOATVALUE value;
+        if (MV_CC_GetFloatValue(handle_, "ResultingFrameRate", &value) == MV_OK) return value.fCurValue;
+        if (MV_CC_GetFloatValue(handle_, "AcquisitionFrameRate", &value) == MV_OK) return value.fCurValue;
+        return 0.0f;
+    }
+
+    bool set_pixel_format(unsigned int format) {
+        if (!is_open_) return false;
+        if (saved_pixel_format_ == format && format != 0) return true;
+
+        bool was_grabbing = is_grabbing_;
+        if (was_grabbing) stop_grabbing();
+
+        int ret = MV_CC_SetEnumValue(handle_, "PixelFormat", format);
+        if (ret != MV_OK) {
+            if (was_grabbing) start_grabbing();
+            return false;
+        }
+
+        saved_pixel_format_ = format;
+        if (was_grabbing) start_grabbing();
+        return true;
+    }
+
+    bool is_open() const { return is_open_; }
+    bool is_grabbing() const { return is_grabbing_; }
+
+    // 新增功能：通过序列号打开相机
+    bool open_by_serial_number(const std::string &serial_number) {
+        if (is_open_) return false;
+
+        MV_CC_DEVICE_INFO_LIST device_list;
+        memset(&device_list, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+
+        int ret = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &device_list);
+        if (ret != MV_OK) {
+            set_error("Enumerate devices failed", ret);
+            return false;
+        }
+
+        // 查找指定序列号的设备
+        int device_index = -1;
+        for (unsigned int i = 0; i < device_list.nDeviceNum; i++) {
+            MV_CC_DEVICE_INFO *info = device_list.pDeviceInfo[i];
+            std::string sn;
+
+            if (info->nTLayerType == MV_GIGE_DEVICE) {
+                sn = std::string((char *)info->SpecialInfo.stGigEInfo.chSerialNumber);
+            } else if (info->nTLayerType == MV_USB_DEVICE) {
+                sn = std::string((char *)info->SpecialInfo.stUsb3VInfo.chSerialNumber);
+            }
+
+            if (sn == serial_number) {
+                device_index = i;
+                break;
+            }
+        }
+
+        if (device_index < 0) {
+            last_error_ = "Device with serial number '" + serial_number + "' not found";
+            return false;
+        }
+        return open(device_index);
+    }
+
+    
+
+private:
+    void *handle_;
+    bool is_open_;
+    bool is_grabbing_;
+    unsigned char *convert_buffer_;
+    unsigned int buffer_size_;
+    unsigned int device_index_;
+    float saved_exposure_;
+    float saved_gain_;
+    bool saved_trigger_;
+    float saved_frame_rate_;
+    unsigned int saved_pixel_format_;
+    std::string last_error_;
+
+    size_t estimate_buffer_size(unsigned int format, unsigned int w, unsigned int h) {
+        switch (format) {
+        case PixelType_Gvsp_Mono8: return w * h;
+        case PixelType_Gvsp_RGB8_Packed:
+        case PixelType_Gvsp_BGR8_Packed: return w * h * 3;
+        case PixelType_Gvsp_RGBA8_Packed:
+        case PixelType_Gvsp_BGRA8_Packed: return w * h * 4;
+        default: return w * h * 3;
+        }
+    }
+
+    // 设置错误信息
+    void set_error(const std::string &error, int error_code) {
+        std::ostringstream oss;
+        oss << error << " (Error code: 0x" << std::hex << error_code << ")";
+        last_error_ = oss.str();
+    }
+};
+
+// ROS2节点类
+class CameraNode : public rclcpp::Node {
+public:
+    explicit CameraNode() : Node("camera_driver") {
+        declare_parameter("exposure", 4000.0);
+        declare_parameter("image_gain", 16.9807);
+        declare_parameter("use_trigger", false);
+        declare_parameter("fps", 165.0);
+        declare_parameter("pixel_format_code", static_cast<int>(PixelType_Gvsp_BayerRG8));
+        declare_parameter("camera_frame", "camera_optical_frame");
+        declare_parameter("serial_number", "");
+
+        exposure_ = get_parameter("exposure").as_double();
+        gain_ = get_parameter("image_gain").as_double();
+        trigger_ = get_parameter("use_trigger").as_bool();
+        frame_rate_ = get_parameter("fps").as_double();
+        pixel_format_ = get_parameter("pixel_format_code").as_int();
+        frame_id_ = get_parameter("camera_frame").as_string();
+        serial_number_ = get_parameter("serial_number").as_string();
+
+        param_callback_ = add_on_set_parameters_callback([this](const auto &params) {
+            rcl_interfaces::msg::SetParametersResult result;
+            result.successful = true;
+            std::ostringstream reason;
+            
+            // 遍历所有参数变更
+            for (const auto &p : params) {
+                if (p.get_name() == "exposure") {
+                    double v = p.as_double();
+                    double previous = exposure_;
+                    if (!camera_.set_exposure(v)) {
+                        result.successful = false;
+                        exposure_ = previous;
+                        if (!reason.str().empty()) reason << "; ";
+                        reason << "曝光时间设置失败: " << camera_.get_last_error();
+                    } else {
+                        exposure_ = v;
+                    }
+                } else if (p.get_name() == "image_gain") {
+                    double v = p.as_double();
+                    double previous = gain_;
+                    if (!camera_.set_gain(v)) {
+                        result.successful = false;
+                        gain_ = previous;
+                        if (!reason.str().empty()) reason << "; ";
+                        reason << "增益设置失败: " << camera_.get_last_error();
+                    } else {
+                        gain_ = v;
+                    }
+                } else if (p.get_name() == "use_trigger") {
+                    bool v = p.as_bool();
+                    bool previous = trigger_;
+                    if (!camera_.set_trigger_mode(v)) {
+                        result.successful = false;
+                        trigger_ = previous;
+                        if (!reason.str().empty()) reason << "; ";
+                        reason << "触发模式设置失败: " << camera_.get_last_error();
+                    } else {
+                        trigger_ = v;
+                    }
+                } else if (p.get_name() == "fps") {
+                    double v = p.as_double();
+                    if (v <= 0.0) {
+                        result.successful = false;
+                        if (!reason.str().empty()) reason << "; ";
+                        reason << "帧率必须大于0";
+                        continue;
+                    }
+                    double previous = frame_rate_;
+                    if (!camera_.set_frame_rate(v)) {
+                        result.successful = false;
+                        frame_rate_ = previous;
+                        if (!reason.str().empty()) reason << "; ";
+                        reason << "帧率设置失败: " << camera_.get_last_error();
+                    } else {
+                        frame_rate_ = v;
+                    }
+                } else if (p.get_name() == "pixel_format_code") {
+                    int v = p.as_int();
+                    unsigned int previous = pixel_format_;
+                    if (!camera_.set_pixel_format(v)) {
+                        result.successful = false;
+                        pixel_format_ = previous;
+                        if (!reason.str().empty()) reason << "; ";
+                        reason << "像素格式设置失败: " << camera_.get_last_error();
+                    } else {
+                        pixel_format_ = v;
+                    }
+                } else if (p.get_name() == "camera_frame") {
+                    frame_id_ = p.as_string();
+                } else if (p.get_name() == "serial_number") {
+                    std::string v = p.as_string();
+                    if (v != serial_number_) {
+                        if (camera_.is_open()) {
+                            RCLCPP_WARN(get_logger(), "序列号变更需要重启节点");
+                        }
+                        serial_number_ = v;
+                    }
+                }
+            }
+            result.reason = reason.str();
+            return result;
+        });
+
+        publisher_ = create_publisher<sensor_msgs::msg::Image>("/image_raw", 10);
+        timer_ = create_wall_timer(2ms, std::bind(&CameraNode::publish_image, this));
+        last_fps_time_ = now();
+    }
+
+    ~CameraNode() {
+        camera_.close();
+    }
+
+private:
+    void publish_image() {
+        // 如果相机未连接，尝试重连
+        if (!camera_.is_open()) {
+            if (!settings_applied_ || (now() - last_attempt_).seconds() >= 1.0) {
+                last_attempt_ = now();
+                bool success = false;
+                
+                if (!serial_number_.empty()) {
+                    // 使用序列号打开相机
+                    success = camera_.open_by_serial_number(serial_number_);
+                    if (success) {
+                        apply_settings();
+                        camera_.start_grabbing();
+                    }
+                } else {
+                    // 使用设备索引重连
+                    success = camera_.reconnect(0, 3, 500);
+                    if (success) {
+                        apply_settings();
+                    }
+                }
+                
+                if (success) {
+                    RCLCPP_INFO(get_logger(), "相机连接成功");
+                } else {
+                    RCLCPP_WARN(get_logger(), "相机连接失败: %s", camera_.get_last_error().c_str());
+                }
+            }
+            return;
+        }
+
+        // 如果设置未应用，应用相机设置
+        if (!settings_applied_) apply_settings();
+        
+        // 如果相机未开始采集，开始采集
+        if (!camera_.is_grabbing()) {
+            if (!camera_.start_grabbing()) {
+                RCLCPP_WARN(get_logger(), "开始采集失败: %s", camera_.get_last_error().c_str());
+                camera_.close();
+                settings_applied_ = false;
+                return;
+            }
+        }
+
+        // 采集图像数据
+        ImageData img;
+        if (!camera_.grab_image(img, 1000, pixel_format_)) {
+            consecutive_failures_++;
+            // 连续失败5次后使用重连功能
+            if (consecutive_failures_ >= 5) {
+                RCLCPP_WARN(get_logger(), "连续采集失败 %u 次，触发重连", consecutive_failures_);
+                bool success = false;
+                
+                if (!serial_number_.empty()) {
+                    success = camera_.open_by_serial_number(serial_number_);
+                    if (success) {
+                        apply_settings();
+                        camera_.start_grabbing();
+                    }
+                } else {
+                    success = camera_.reconnect(0, 3, 500);
+                    if (success) {
+                        apply_settings();
+                    }
+                }
+                
+                if (success) {
+                    RCLCPP_INFO(get_logger(), "重连成功");
+                } else {
+                    RCLCPP_ERROR(get_logger(), "重连失败: %s", camera_.get_last_error().c_str());
+                }
+                consecutive_failures_ = 0;
+            }
+            return;
+        }
+        consecutive_failures_ = 0;
+
+        // 检查图像数据有效性
+        if (!img.data || !img.width || !img.height) return;
+
+        std::string encoding = to_encoding(img.pixelFormat);
+        cv::Mat frame(img.height, img.width, CV_8UC1, img.data);
+
+        if (sensor_msgs::image_encodings::isBayer(encoding)) {
+            cv::Mat rgb;
+            if (encoding == sensor_msgs::image_encodings::BAYER_RGGB8) {
+                cv::demosaicing(frame, rgb, cv::COLOR_BayerRG2RGB);
+            } else if (encoding == sensor_msgs::image_encodings::BAYER_GRBG8) {
+                cv::demosaicing(frame, rgb, cv::COLOR_BayerGR2RGB);
+            } else if (encoding == sensor_msgs::image_encodings::BAYER_GBRG8) {
+                cv::demosaicing(frame, rgb, cv::COLOR_BayerGB2RGB);
+            } else {
+                cv::demosaicing(frame, rgb, cv::COLOR_BayerBG2RGB);
+            }
+            frame = rgb;
+            encoding = sensor_msgs::image_encodings::RGB8;
+        }
+
+        auto header = std_msgs::msg::Header();
+        header.stamp = now();
+        header.frame_id = frame_id_;
+
+        auto msg = cv_bridge::CvImage(header, encoding, frame).toImageMsg();
+        publisher_->publish(*msg);
+
+        auto current_time = now();
+        if ((current_time - last_fps_time_).seconds() >= 1.0) {
+            double fps = camera_.get_frame_rate();
+            RCLCPP_INFO(get_logger(), "FPS: %.2f, Size: %ux%u", fps, img.width, img.height);
+            last_fps_time_ = current_time;
+        }
+    }
+
+    // 应用所有相机参数设置
+    void apply_settings() {
+        if (!camera_.is_open()) return;
+        
+        bool ok = true;
+        auto try_set = [&](const std::string &name, bool success) {
+            if (!success) {
+                ok = false;
+                RCLCPP_WARN(get_logger(), "%s 设置失败: %s", name.c_str(), camera_.get_last_error().c_str());
+            }
+        };
+
+        try_set("曝光时间", camera_.set_exposure(exposure_));
+        try_set("增益", camera_.set_gain(gain_));
+        try_set("触发模式", camera_.set_trigger_mode(trigger_));
+        if (frame_rate_ > 0.0) {
+            try_set("帧率", camera_.set_frame_rate(frame_rate_));
+        }
+        try_set("像素格式", camera_.set_pixel_format(pixel_format_));
+        
+        settings_applied_ = ok;
+    }
+
+    std::string to_encoding(unsigned int format) const {
+        switch (format) {
+        case PixelType_Gvsp_Mono8: return sensor_msgs::image_encodings::MONO8;
+        case PixelType_Gvsp_RGB8_Packed: return sensor_msgs::image_encodings::RGB8;
+        case PixelType_Gvsp_BGR8_Packed: return sensor_msgs::image_encodings::BGR8;
+        case PixelType_Gvsp_RGBA8_Packed: return sensor_msgs::image_encodings::RGBA8;
+        case PixelType_Gvsp_BGRA8_Packed: return sensor_msgs::image_encodings::BGRA8;
+        case PixelType_Gvsp_BayerRG8: return sensor_msgs::image_encodings::BAYER_RGGB8;
+        default: return sensor_msgs::image_encodings::BAYER_RGGB8;
+        }
+    }
+
+    CameraControl camera_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher_;
+    rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_;
+
+    double exposure_;
+    double gain_;
+    bool trigger_;
+    double frame_rate_;
+    unsigned int pixel_format_;
+    std::string frame_id_;
+    std::string serial_number_;
+    
+    bool settings_applied_ = false;
+    rclcpp::Time last_attempt_;
+    rclcpp::Time last_fps_time_;
+    unsigned int consecutive_failures_ = 0;
+};
+
+int main(int argc, char **argv) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<CameraNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

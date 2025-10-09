@@ -1,62 +1,61 @@
-cmake_minimum_required(VERSION 3.10)
-project(hk_camera)
+cmake_minimum_required(VERSION 3.8)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
+project(hik_camera)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(image_transport REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
 
-# Include directories for Hikvision MVS SDK
-# Adjust this path according to where the MVS SDK is installed
-set(MVS_SDK_PATH "/opt/MVS" CACHE PATH "Path to MVS SDK")
-include_directories(${MVS_SDK_PATH}/include)
 
-# Link directories for Hikvision MVS SDK
-link_directories(${MVS_SDK_PATH}/lib/64)
-
-# Add executable
-add_executable(hk_camera_node_main src/hk_camera_node_main.cpp src/hk_camera_node.cpp)
-
-# Target include directories
-target_include_directories(hk_camera_node_main PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>
-  ${MVS_SDK_PATH}/include
+add_executable(hik_camera_node hik_camera.cpp)
+target_include_directories(hik_camera_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/hik_camera>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(hik_camera_node PUBLIC c_std_99 cxx_std_17)
+ament_target_dependencies(
+  hik_camera_node
+  "rclcpp"
+  "sensor_msgs"
+  "cv_bridge"
+  "OpenCV"
 )
 
-# Target link libraries
-target_link_libraries(hk_camera_node_main
-  ${OpenCV_LIBS}
-  rclcpp::rclcpp
-  rclcpp_components::component
-  sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
-  image_transport::image_transport
-  cv_bridge::cv_bridge
-  # Hikvision MVS SDK libraries
-  MvCameraControl
-)
+# Link against the Hikvision SDK libraries installed in /opt/MVS
+set(HIK_SDK_DIR "/opt/MVS")
+set(HIK_SDK_INCLUDE_DIR "${HIK_SDK_DIR}/include")
+set(HIK_SDK_LIB_DIR "${HIK_SDK_DIR}/lib/64")
 
-# Install targets
-install(TARGETS hk_camera_node_main
-  DESTINATION lib/${PROJECT_NAME}
-)
+if(EXISTS ${HIK_SDK_INCLUDE_DIR} AND EXISTS ${HIK_SDK_LIB_DIR})
+  message(STATUS "Found Hikvision SDK in ${HIK_SDK_DIR}")
+  target_include_directories(hik_camera_node PUBLIC ${HIK_SDK_INCLUDE_DIR})
+  target_link_libraries(hik_camera_node 
+    ${HIK_SDK_LIB_DIR}/libMvCameraControl.so
+    ${HIK_SDK_LIB_DIR}/libMvCameraControlWrapper.so
+  )
+  # ensure runtime linker can find the .so when running from build tree
+  set_target_properties(hik_camera_node PROPERTIES BUILD_RPATH "${HIK_SDK_LIB_DIR}" INSTALL_RPATH "${HIK_SDK_LIB_DIR}")
+else()
+  message(WARNING "Hikvision SDK not found in ${HIK_SDK_DIR}")
+endif()
 
-# Install launch files
+install(TARGETS hik_camera_node
+  DESTINATION lib/${PROJECT_NAME})
+
+# Install launch files so ros2 launch can find them
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
+  FILES_MATCHING PATTERN "*.py"
 )
 
-# Install config files
+# Install configuration files
 install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
+  FILES_MATCHING PATTERN "*.yaml"
 )
 
 if(BUILD_TESTING)

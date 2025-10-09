@@ -1,23 +1,25 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>hk_camera</name>
+  <name>hik_camera</name>
   <version>1.0.0</version>
-  <description>ROS2 driver for Hikvision cameras using MVS SDK 4.6</description>
-  <maintainer email="kkkfff@qq.com">kkkfff</maintainer>
+  <description>ROS 2 driver for Hikvision industrial cameras</description>
+  <maintainer email="developer@hello.com">user</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
-  <depend>rclcpp_components</depend>
   <depend>sensor_msgs</depend>
-  <depend>image_transport</depend>
   <depend>cv_bridge</depend>
-  <depend>opencv2</depend>
+  <depend>image_transport</depend>
+  <depend>opencv</depend>
 
+  <build_depend>launch</build_depend>
+  <build_depend>launch_ros</build_depend>
+
+  <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
-  <exec_depend>rviz2</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
