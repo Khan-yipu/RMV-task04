@@ -860,32 +860,39 @@ private:
 
         // Bayer格式去马赛克处理
         if (sensor_msgs::image_encodings::isBayer(encoding)) {
-            cv::Mat rgb;
+            cv::Mat bgr;
             
             // 根据不同的Bayer模式选择对应的去马赛克算法
+            // 由于颜色显示异常（黄色变蓝色、蓝色变橘色），可能是R和B通道互换
             if (encoding == sensor_msgs::image_encodings::BAYER_RGGB8 ||
                 encoding == sensor_msgs::image_encodings::BAYER_RGGB16) {
-                cv::demosaicing(frame, rgb, cv::COLOR_BayerRG2RGB);
+                cv::demosaicing(frame, bgr, cv::COLOR_BayerRG2BGR);
             } else if (encoding == sensor_msgs::image_encodings::BAYER_GRBG8 ||
                        encoding == sensor_msgs::image_encodings::BAYER_GRBG16) {
-                cv::demosaicing(frame, rgb, cv::COLOR_BayerGR2RGB);
+                cv::demosaicing(frame, bgr, cv::COLOR_BayerGR2BGR);
             } else if (encoding == sensor_msgs::image_encodings::BAYER_GBRG8 ||
                        encoding == sensor_msgs::image_encodings::BAYER_GBRG16) {
-                cv::demosaicing(frame, rgb, cv::COLOR_BayerGB2RGB);
+                cv::demosaicing(frame, bgr, cv::COLOR_BayerGB2BGR);
             } else if (encoding == sensor_msgs::image_encodings::BAYER_BGGR8 ||
                        encoding == sensor_msgs::image_encodings::BAYER_BGGR16) {
-                cv::demosaicing(frame, rgb, cv::COLOR_BayerBG2RGB);
+                cv::demosaicing(frame, bgr, cv::COLOR_BayerBG2BGR);
             } else {
-                RCLCPP_WARN(get_logger(), "未知Bayer格式: %s，使用默认RGGB模式", encoding.c_str());
-                cv::demosaicing(frame, rgb, cv::COLOR_BayerRG2RGB);
+                RCLCPP_WARN(get_logger(), "未知Bayer格式: %s，使用默认RGGB到BGR模式", encoding.c_str());
+                cv::demosaicing(frame, bgr, cv::COLOR_BayerRG2BGR);
             }
             
-            frame = rgb;
-            // 更新编码格式为RGB格式
+            // 手动交换R和B通道以修复颜色问题
+            std::vector<cv::Mat> channels;
+            cv::split(bgr, channels);
+            std::swap(channels[0], channels[2]); // 交换B和R通道
+            cv::merge(channels, bgr);
+            
+            frame = bgr;
+            // 更新编码格式为BGR格式
             encoding = (encoding.find("16") != std::string::npos) ? 
-                       sensor_msgs::image_encodings::RGB16 : 
-                       sensor_msgs::image_encodings::RGB8;
-            RCLCPP_DEBUG(get_logger(), "Bayer图像已转换为RGB格式: %s", encoding.c_str());
+                       sensor_msgs::image_encodings::BGR16 : 
+                       sensor_msgs::image_encodings::BGR8;
+            RCLCPP_DEBUG(get_logger(), "Bayer图像已转换并交换R/B通道: %s", encoding.c_str());
         }
         
         // YUV422格式转换
