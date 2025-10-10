@@ -61,28 +61,94 @@ public:
     bool reconnect(unsigned int index, int max_retries = 5, int retry_delay_ms = 1000) {
         device_index_ = index;
         
-        for (int attempt = 1; attempt <= max_retries && !is_open_; ++attempt) {
-            if (is_grabbing_) stop_grabbing();
-            if (is_open_) close();
+        for (int attempt = 1; attempt <= max_retries; ++attempt) {
+            // 确保先关闭旧的连接
+            if (is_grabbing_) {
+                RCLCPP_DEBUG(rclcpp::get_logger("camera_driver"), "重连尝试 %d/%d: 停止采集", attempt, max_retries);
+                stop_grabbing();
+            }
+            if (is_open_) {
+                RCLCPP_DEBUG(rclcpp::get_logger("camera_driver"), "重连尝试 %d/%d: 关闭设备", attempt, max_retries);
+                close();
+            }
             
-            std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms * attempt));
+            // 退避策略：重试间隔逐渐增加
+            int current_delay = retry_delay_ms * attempt;
+            RCLCPP_INFO(rclcpp::get_logger("camera_driver"), 
+                       "重连尝试 %d/%d: 等待 %dms 后重连", attempt, max_retries, current_delay);
+            std::this_thread::sleep_for(std::chrono::milliseconds(current_delay));
             
-            if (!open(index)) continue;
+            // 尝试打开相机
+            if (!open(index)) {
+                RCLCPP_WARN(rclcpp::get_logger("camera_driver"), 
+                           "重连尝试 %d/%d: 打开设备失败 - %s", attempt, max_retries, get_last_error().c_str());
+                continue;
+            }
+            
+            RCLCPP_INFO(rclcpp::get_logger("camera_driver"), 
+                       "重连尝试 %d/%d: 设备打开成功，恢复设置", attempt, max_retries);
             
             // 恢复设置
-            if (saved_exposure_ > 0.0f) set_exposure(saved_exposure_);
-            if (saved_gain_ > 0.0f) set_gain(saved_gain_);
-            if (saved_frame_rate_ > 0.0f) set_frame_rate(saved_frame_rate_);
-            if (saved_pixel_format_ > 0) set_pixel_format(saved_pixel_format_);
-            set_trigger_mode(saved_trigger_);
+            bool settings_ok = true;
             
+            if (saved_pixel_format_ > 0) {
+                if (!set_pixel_format(saved_pixel_format_)) {
+                    RCLCPP_WARN(rclcpp::get_logger("camera_driver"), 
+                               "恢复像素格式失败: %s", get_last_error().c_str());
+                    settings_ok = false;
+                }
+            }
+            
+            if (saved_exposure_ > 0.0f) {
+                if (!set_exposure(saved_exposure_)) {
+                    RCLCPP_WARN(rclcpp::get_logger("camera_driver"), 
+                               "恢复曝光时间失败: %s", get_last_error().c_str());
+                    settings_ok = false;
+                }
+            }
+            
+            if (saved_gain_ > 0.0f) {
+                if (!set_gain(saved_gain_)) {
+                    RCLCPP_WARN(rclcpp::get_logger("camera_driver"), 
+                               "恢复增益失败: %s", get_last_error().c_str());
+                    settings_ok = false;
+                }
+            }
+            
+            if (saved_frame_rate_ > 0.0f) {
+                if (!set_frame_rate(saved_frame_rate_)) {
+                    RCLCPP_WARN(rclcpp::get_logger("camera_driver"), 
+                               "恢复帧率失败: %s", get_last_error().c_str());
+                    settings_ok = false;
+                }
+            }
+            
+            if (!set_trigger_mode(saved_trigger_)) {
+                RCLCPP_WARN(rclcpp::get_logger("camera_driver"), 
+                           "恢复触发模式失败: %s", get_last_error().c_str());
+                settings_ok = false;
+            }
+            
+            // 尝试开始采集
             if (!start_grabbing()) {
+                RCLCPP_WARN(rclcpp::get_logger("camera_driver"), 
+                           "重连尝试 %d/%d: 开始采集失败 - %s", attempt, max_retries, get_last_error().c_str());
                 close();
                 continue;
             }
             
+            RCLCPP_INFO(rclcpp::get_logger("camera_driver"), 
+                       "重连尝试 %d/%d: 成功", attempt, max_retries);
+            if (!settings_ok) {
+                RCLCPP_WARN(rclcpp::get_logger("camera_driver"), 
+                           "部分设置恢复失败，但相机重连成功");
+            }
+            
             return true;
         }
+        
+        RCLCPP_ERROR(rclcpp::get_logger("camera_driver"), 
+                    "重连失败: 经过 %d 次尝试后仍无法连接相机", max_retries);
         return false;
     }
 
@@ -777,16 +843,27 @@ private:
     void publish_image() {
         // 如果相机未连接，尝试重连
         if (!camera_.is_open()) {
-            if (!settings_applied_ || (now() - last_attempt_).seconds() >= 1.0) {
+            if (!settings_applied_ || !last_attempt_valid_ || (now() - last_attempt_).seconds() >= reconnect_interval_sec_) {
                 last_attempt_ = now();
+                last_attempt_valid_ = true;
                 bool success = false;
+                
+                RCLCPP_WARN(get_logger(), "相机未连接，尝试重新连接...");
                 
                 if (!serial_number_.empty()) {
                     // 使用序列号打开相机
                     success = camera_.open_by_serial_number(serial_number_);
                     if (success) {
-                        apply_settings();
-                        camera_.start_grabbing();
+                        bool settings_ok = apply_settings();
+                        if (!camera_.start_grabbing()) {
+                            RCLCPP_WARN(get_logger(), "开始采集失败: %s", camera_.get_last_error().c_str());
+                            camera_.close();
+                            settings_applied_ = false;
+                            last_attempt_valid_ = false;
+                            success = false;
+                        } else if (!settings_ok) {
+                            RCLCPP_WARN(get_logger(), "相机连接成功，但部分参数应用失败");
+                        }
                     }
                 } else {
                     // 使用设备索引重连
@@ -797,16 +874,21 @@ private:
                 }
                 
                 if (success) {
-                    RCLCPP_INFO(get_logger(), "相机连接成功");
+                    RCLCPP_INFO(get_logger(), "相机重连成功");
                 } else {
-                    RCLCPP_WARN(get_logger(), "相机连接失败: %s", camera_.get_last_error().c_str());
+                    RCLCPP_WARN(get_logger(), "相机重连失败: %s", camera_.get_last_error().c_str());
                 }
             }
             return;
         }
 
         // 如果设置未应用，应用相机设置
-        if (!settings_applied_) apply_settings();
+        if (!settings_applied_) {
+            bool settings_ok = apply_settings();
+            if (!settings_ok) {
+                RCLCPP_WARN(get_logger(), "部分相机参数应用失败，将继续尝试");
+            }
+        }
         
         // 如果相机未开始采集，开始采集
         if (!camera_.is_grabbing()) {
@@ -822,33 +904,34 @@ private:
         ImageData img;
         if (!camera_.grab_image(img, 1000, pixel_format_)) {
             consecutive_failures_++;
-            // 连续失败5次后使用重连功能
-            if (consecutive_failures_ >= 5) {
-                RCLCPP_WARN(get_logger(), "连续采集失败 %u 次，触发重连", consecutive_failures_);
-                bool success = false;
-                
-                if (!serial_number_.empty()) {
-                    success = camera_.open_by_serial_number(serial_number_);
-                    if (success) {
-                        apply_settings();
-                        camera_.start_grabbing();
-                    }
-                } else {
-                    success = camera_.reconnect(0, 3, 500);
-                    if (success) {
-                        apply_settings();
-                    }
-                }
-                
-                if (success) {
-                    RCLCPP_INFO(get_logger(), "重连成功");
-                } else {
-                    RCLCPP_ERROR(get_logger(), "重连失败: %s", camera_.get_last_error().c_str());
-                }
+            
+            // 使用 throttle 日志避免日志刷屏
+            auto now_time = now();
+            auto throttle_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(2)).count();
+            
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), throttle_ns,
+                               "获取图像失败 (连续失败: %u次): %s",
+                               consecutive_failures_, camera_.get_last_error().c_str());
+            
+            // 连续失败次数过多，可能是连接断开，强制关闭并重连
+            if (consecutive_failures_ >= max_grab_failures_) {
+                RCLCPP_WARN(get_logger(), "连续获取图像失败 %u 次，关闭相机以触发重连", 
+                           consecutive_failures_);
+                camera_.close();
+                settings_applied_ = false;
+                last_attempt_valid_ = false;
+                consecutive_failures_ = 0;
+            }
+            
+            if (!camera_.is_open()) {
+                settings_applied_ = false;
+                last_attempt_valid_ = false;
                 consecutive_failures_ = 0;
             }
             return;
         }
+        
+        // 成功获取图像，重置连续失败计数器
         consecutive_failures_ = 0;
 
         // 检查图像数据有效性
@@ -928,8 +1011,8 @@ private:
     }
 
     // 应用所有相机参数设置
-    void apply_settings() {
-        if (!camera_.is_open()) return;
+    bool apply_settings() {
+        if (!camera_.is_open()) return false;
         
         bool ok = true;
         auto try_set = [&](const std::string &name, bool success) {
@@ -939,12 +1022,7 @@ private:
             }
         };
 
-        try_set("曝光时间", camera_.set_exposure(exposure_));
-        try_set("增益", camera_.set_gain(gain_));
-        try_set("触发模式", camera_.set_trigger_mode(trigger_));
-        if (frame_rate_ > 0.0) {
-            try_set("帧率", camera_.set_frame_rate(frame_rate_));
-        }
+        // 先设置像素格式，因为其他设置可能依赖于像素格式
         if (camera_.is_pixel_format_supported(pixel_format_)) {
             try_set("像素格式", camera_.set_pixel_format(pixel_format_));
         } else {
@@ -954,10 +1032,30 @@ private:
             if (camera_.set_pixel_format(default_format)) {
                 pixel_format_ = default_format;
                 RCLCPP_INFO(get_logger(), "已使用默认像素格式: 0x%08X", default_format);
+            } else {
+                ok = false;
+                RCLCPP_WARN(get_logger(), "默认像素格式设置失败");
+            }
+        }
+        
+        try_set("曝光时间", camera_.set_exposure(exposure_));
+        try_set("增益", camera_.set_gain(gain_));
+        try_set("触发模式", camera_.set_trigger_mode(trigger_));
+        
+        if (frame_rate_ > 0.0) {
+            bool success = camera_.set_frame_rate(frame_rate_);
+            try_set("帧率", success);
+            if (success) {
+                double applied = static_cast<double>(camera_.get_frame_rate());
+                if (applied > 0.0) {
+                    frame_rate_ = applied;
+                    RCLCPP_INFO(get_logger(), "帧率已设置: %.2f Hz", applied);
+                }
             }
         }
         
         settings_applied_ = ok;
+        return ok;
     }
 
     std::string to_encoding(unsigned int format) const {
@@ -1016,9 +1114,12 @@ private:
     std::string serial_number_;
     
     bool settings_applied_ = false;
+    bool last_attempt_valid_ = false;
     rclcpp::Time last_attempt_;
     rclcpp::Time last_fps_time_;
     unsigned int consecutive_failures_ = 0;
+    const double reconnect_interval_sec_ = 1.0;
+    const unsigned int max_grab_failures_ = 5;
 };
 
 int main(int argc, char **argv) {
