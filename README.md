@@ -98,11 +98,22 @@ ros2 param set /camera_driver exposure 6000.0
 ros2 param set /camera_driver fps 120.0
 ```
 
+### 实际帧率
+
+相机的实际帧率受到曝光时间、增益、像素格式、图像尺寸等因素的影响，以及相机硬件性能和系统负载。
+例如，第一次海康相机在3072x2048原始分辨率受限的情况下，实际帧率只有约42帧。
+![实际帧率](./img/fps42.png)
+
+启动海康相机客户端MVS将分辨率修改为1280x720以后，帧率提高到了115帧。
+![帧率提高](./img/fps115.png)
+
 ## 节点信息
 
 - **节点名称**: `camera_driver`
 - **发布话题**: `/image_raw` (sensor_msgs/Image)
 - **参数服务**: 支持动态参数配置
+
+
 
 
 

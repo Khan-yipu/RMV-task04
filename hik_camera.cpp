@@ -419,8 +419,15 @@ public:
     float get_frame_rate() {
         if (!is_open_) return 0.0f;
         MVCC_FLOATVALUE value;
+        // 返回设置的帧率而不是实际帧率，这样能反映用户的设置意图
+        if (MV_CC_GetFloatValue(handle_, "AcquisitionFrameRate", &value) == MV_OK) return value.fCurValue;
+        return saved_frame_rate_;
+    }
+    
+    float get_actual_frame_rate() {
+        if (!is_open_) return 0.0f;
+        MVCC_FLOATVALUE value;
         if (MV_CC_GetFloatValue(handle_, "ResultingFrameRate", &value) == MV_OK) return value.fCurValue;
-        //if (MV_CC_GetFloatValue(handle_, "AcquisitionFrameRate", &value) == MV_OK) return value.fCurValue;
         return 0.0f;
     }
 
@@ -913,8 +920,9 @@ private:
 
         auto current_time = now();
         if ((current_time - last_fps_time_).seconds() >= 1.0) {
-            double fps = camera_.get_frame_rate();
-            RCLCPP_INFO(get_logger(), "FPS: %.2f, Size: %ux%u", fps, img.width, img.height);
+            double set_fps = camera_.get_frame_rate();
+            double actual_fps = camera_.get_actual_frame_rate();
+            RCLCPP_INFO(get_logger(), "FPS设置: %.2f, 实际: %.2f, Size: %ux%u", set_fps, actual_fps, img.width, img.height);
             last_fps_time_ = current_time;
         }
     }
