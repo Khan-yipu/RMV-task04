@@ -33,7 +33,7 @@ set(HIK_SDK_LIB_DIR "${HIK_SDK_DIR}/lib/64")
 if(EXISTS ${HIK_SDK_INCLUDE_DIR} AND EXISTS ${HIK_SDK_LIB_DIR})
   message(STATUS "Found Hikvision SDK in ${HIK_SDK_DIR}")
   target_include_directories(hik_camera_node PUBLIC ${HIK_SDK_INCLUDE_DIR})
-  target_link_libraries(hik_camera_node 
+  target_link_libraries(hik_camera_node
     ${HIK_SDK_LIB_DIR}/libMvCameraControl.so
     ${HIK_SDK_LIB_DIR}/libMvCameraControlWrapper.so
   )
@@ -56,6 +56,12 @@ install(DIRECTORY launch/
 install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
   FILES_MATCHING PATTERN "*.yaml"
+)
+
+# 安装RViz配置文件
+install(
+  FILES config/hik_camera.rviz
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
 if(BUILD_TESTING)
